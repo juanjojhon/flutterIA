@@ -34,6 +34,15 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
+  
+  # BLE support for connecting to Arduino Nano 33 BLE
+  flutter_blue_plus: ^1.35.5
+  
+  # Permission handling for Bluetooth
+  permission_handler: ^11.4.0
+  
+  # Provider for state management
+  provider: ^6.1.4
 
 dev_dependencies:
   flutter_test:
