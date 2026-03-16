@@ -66,5 +66,13 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Esta app necesita Bluetooth para conectarse con tu Arduino Tennis Detector</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Esta app necesita Bluetooth para detectar golpes de tenis</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
 </dict>
 </plist>
