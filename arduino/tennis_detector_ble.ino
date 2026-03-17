@@ -30,12 +30,15 @@ BLEService tennisService("180C");
 // Characteristic for sending detected stroke (read/notify)
 BLEByteCharacteristic strokeCharacteristic("2A56", BLERead | BLENotify);
 
-// Characteristic for receiving control commands (write)
+// Characteristic for receiving control commands (write + notify)
 // 0 = stop recording, 1 = start recording
-BLEByteCharacteristic controlCharacteristic("2A57", BLEWrite);
+// Arduino notifies when recording auto-stops
+BLEByteCharacteristic controlCharacteristic("2A57", BLEWrite | BLENotify);
 
 /* Recording state */
 bool isRecording = false;
+unsigned long recordingStartTime = 0;
+const unsigned long RECORDING_DURATION_MS = 4000; // 4 seconds max recording
 
 /* LED pins for status indication */
 #define LED_CONNECTED   LED_BUILTIN
@@ -116,13 +119,22 @@ void onControlWritten(BLEDevice central, BLECharacteristic characteristic) {
     
     if (value == 1) {
         isRecording = true;
+        recordingStartTime = millis();
         digitalWrite(LED_RECORDING, LOW);  // LOW = ON for RGB LED
-        Serial.println(">>> Recording STARTED");
+        Serial.println(">>> Recording STARTED (4 sec window)");
     } else {
         isRecording = false;
         digitalWrite(LED_RECORDING, HIGH);  // HIGH = OFF for RGB LED
         Serial.println(">>> Recording STOPPED");
     }
+}
+
+/* Stop recording and notify via BLE */
+void stopRecordingAndNotify() {
+    isRecording = false;
+    digitalWrite(LED_RECORDING, HIGH);  // Turn off recording LED
+    controlCharacteristic.writeValue(0);  // Notify Flutter that recording stopped
+    Serial.println(">>> Recording AUTO-STOPPED");
 }
 
 /* Sign helper function */
@@ -150,7 +162,13 @@ void loop()
             
             // Only detect strokes if recording is enabled
             if (isRecording) {
-                detectAndSendStroke();
+                // Check if recording time exceeded 4 seconds
+                if (millis() - recordingStartTime >= RECORDING_DURATION_MS) {
+                    Serial.println(">>> Recording timeout (4 sec)");
+                    stopRecordingAndNotify();
+                } else {
+                    detectAndSendStroke();
+                }
             } else {
                 // Small delay when not recording to avoid busy loop
                 delay(50);
@@ -263,6 +281,9 @@ void detectAndSendStroke() {
         Serial.print(" (confidence: ");
         Serial.print(max_val * 100, 1);
         Serial.println("%)");
+        
+        // Auto-stop recording after detecting a stroke
+        stopRecordingAndNotify();
     } else {
         Serial.println("No confident stroke detected");
     }

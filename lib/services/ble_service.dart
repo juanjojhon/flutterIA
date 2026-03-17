@@ -2,6 +2,8 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
+const int kRecordingDurationSeconds = 4;
+
 /// UUIDs matching the Arduino code
 class BleUuids {
   static const String serviceUuid = "180c";
@@ -56,6 +58,8 @@ class BleService extends ChangeNotifier {
   StreamSubscription? _scanSubscription;
   StreamSubscription? _connectionSubscription;
   StreamSubscription? _strokeSubscription;
+  StreamSubscription? _controlSubscription;
+  Timer? _recordingTimer;
   
   // Getters
   BleConnectionState get connectionState => _connectionState;
@@ -174,6 +178,15 @@ class BleService extends ChangeNotifier {
             
             if (charUuid.contains(BleUuids.controlCharacteristicUuid)) {
               _controlCharacteristic = characteristic;
+              
+              // Subscribe to control notifications to detect when Arduino stops recording
+              await characteristic.setNotifyValue(true);
+              _controlSubscription = characteristic.onValueReceived.listen((value) {
+                if (value.isNotEmpty && value[0] == 0 && _isRecording) {
+                  // Arduino signaled that recording stopped
+                  _handleRecordingStopped();
+                }
+              });
             }
           }
         }
@@ -191,21 +204,32 @@ class BleService extends ChangeNotifier {
     }
   }
   
-  /// Disconnect from device
+/// Disconnect from device
   Future<void> disconnect() async {
     await stopRecording();
     await _strokeSubscription?.cancel();
     await _connectionSubscription?.cancel();
+    await _controlSubscription?.cancel();
+    _recordingTimer?.cancel();
     await _connectedDevice?.disconnect();
     _handleDisconnection();
   }
-  
+
   void _handleDisconnection() {
     _connectedDevice = null;
     _strokeCharacteristic = null;
     _controlCharacteristic = null;
     _isRecording = false;
+    _recordingTimer?.cancel();
     _connectionState = BleConnectionState.disconnected;
+    notifyListeners();
+  }
+  
+  /// Handle when recording is stopped (by Arduino or timer)
+  void _handleRecordingStopped() {
+    _recordingTimer?.cancel();
+    _isRecording = false;
+    _connectionState = BleConnectionState.connected;
     notifyListeners();
   }
   
@@ -222,6 +246,16 @@ class BleService extends ChangeNotifier {
       _isRecording = true;
       _connectionState = BleConnectionState.recording;
       notifyListeners();
+      
+      // Start a timer that auto-stops after 4 seconds (backup in case Arduino doesn't notify)
+      _recordingTimer?.cancel();
+      _recordingTimer = Timer(const Duration(seconds: kRecordingDurationSeconds), () {
+        if (_isRecording) {
+          debugPrint("Recording timer expired - stopping");
+          stopRecording();
+        }
+      });
+      
       return true;
     } catch (e) {
       debugPrint("Error starting recording: $e");
@@ -231,6 +265,8 @@ class BleService extends ChangeNotifier {
   
   /// Stop recording strokes
   Future<bool> stopRecording() async {
+    _recordingTimer?.cancel();
+    
     if (!_isRecording) return true;
     
     try {

@@ -1,10 +1,68 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/ble_service.dart';
 import 'scan_screen.dart';
 
-class StrokeDetectorScreen extends StatelessWidget {
+class StrokeDetectorScreen extends StatefulWidget {
   const StrokeDetectorScreen({super.key});
+
+  @override
+  State<StrokeDetectorScreen> createState() => _StrokeDetectorScreenState();
+}
+
+class _StrokeDetectorScreenState extends State<StrokeDetectorScreen> {
+  Timer? _countdownTimer;
+  int _remainingSeconds = kRecordingDurationSeconds;
+  bool _wasRecording = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Listen to BleService changes to detect auto-stop
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final bleService = context.read<BleService>();
+      bleService.addListener(_onBleServiceChanged);
+    });
+  }
+
+  void _onBleServiceChanged() {
+    final bleService = context.read<BleService>();
+    // Detect when recording stops (either manually or automatically)
+    if (_wasRecording && !bleService.isRecording) {
+      _stopCountdown();
+    }
+    _wasRecording = bleService.isRecording;
+  }
+
+  @override
+  void dispose() {
+    _countdownTimer?.cancel();
+    final bleService = context.read<BleService>();
+    bleService.removeListener(_onBleServiceChanged);
+    super.dispose();
+  }
+
+  void _startCountdown() {
+    _remainingSeconds = kRecordingDurationSeconds;
+    _countdownTimer?.cancel();
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (_remainingSeconds > 0) {
+        setState(() {
+          _remainingSeconds--;
+        });
+      } else {
+        timer.cancel();
+      }
+    });
+  }
+
+  void _stopCountdown() {
+    _countdownTimer?.cancel();
+    setState(() {
+      _remainingSeconds = kRecordingDurationSeconds;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -118,9 +176,9 @@ class StrokeDetectorScreen extends StatelessWidget {
                                 ),
                               ),
                               const SizedBox(width: 8),
-                              const Text(
-                                'GRABANDO',
-                                style: TextStyle(
+                              Text(
+                                'GRABANDO $_remainingSeconds s',
+                                style: const TextStyle(
                                   color: Colors.white,
                                   fontWeight: FontWeight.bold,
                                   fontSize: 12,
@@ -166,8 +224,14 @@ class StrokeDetectorScreen extends StatelessWidget {
                     Expanded(
                       child: ElevatedButton.icon(
                         onPressed: bleService.isRecording
-                            ? () => bleService.stopRecording()
-                            : () => bleService.startRecording(),
+                            ? () {
+                                bleService.stopRecording();
+                                _stopCountdown();
+                              }
+                            : () {
+                                bleService.startRecording();
+                                _startCountdown();
+                              },
                         style: ElevatedButton.styleFrom(
                           backgroundColor: bleService.isRecording
                               ? Colors.red
