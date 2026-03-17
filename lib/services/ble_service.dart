@@ -2,7 +2,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
-const int kRecordingDurationSeconds = 4;
+const int kRecordingDurationSeconds = 3;
 
 /// UUIDs matching the Arduino code
 class BleUuids {

@@ -1,11 +1,11 @@
-/* 
+/*
  * Edge Impulse + BLE Tennis Stroke Detector
- * For Arduino Nano 33 BLE
- * 
+ * For Arduino Nano 33 BLE / BLE Sense
+ *
  * This code waits for a BLE connection and a start command from
  * the Flutter app before beginning stroke detection.
- * 
- * Golpes detectados:
+ *
+ * Stroke codes sent by BLE:
  * 1 = Ascendente
  * 2 = Derecha
  * 3 = Remate
@@ -17,10 +17,7 @@
 #include <Arduino_LSM9DS1.h>
 #include <ArduinoBLE.h>
 
-/* Constants */
-#define CONVERT_G_TO_MS2 9.80665f
-#define MAX_ACCEPTED_RANGE 2.0f
-
+/* Debug */
 static bool debug_nn = false;
 
 /* BLE configuration */
@@ -30,25 +27,31 @@ BLEService tennisService("180C");
 // Characteristic for sending detected stroke (read/notify)
 BLEByteCharacteristic strokeCharacteristic("2A56", BLERead | BLENotify);
 
-// Characteristic for receiving control commands (write + notify)
+// Characteristic for receiving control commands (write)
 // 0 = stop recording, 1 = start recording
-// Arduino notifies when recording auto-stops
-BLEByteCharacteristic controlCharacteristic("2A57", BLEWrite | BLENotify);
+BLEByteCharacteristic controlCharacteristic("2A57", BLEWrite);
 
 /* Recording state */
 bool isRecording = false;
-unsigned long recordingStartTime = 0;
-const unsigned long RECORDING_DURATION_MS = 4000; // 4 seconds max recording
+
+/* Stroke reporting control */
+unsigned long lastStrokeTime = 0;
+const unsigned long strokeCooldown = 700;   // ms between valid stroke reports
+const float confidence_threshold = 0.60f;   // minimum confidence required
 
 /* LED pins for status indication */
 #define LED_CONNECTED   LED_BUILTIN
-#define LED_RECORDING   LEDR  // Red LED for recording status
+#define LED_RECORDING   LEDR   // Red LED on Nano 33 BLE Sense
+
+/* Function prototypes */
+void onControlWritten(BLEDevice central, BLECharacteristic characteristic);
+void detectAndSendStroke();
+void printStrokeName(int code);
 
 /* Setup */
 void setup()
 {
     Serial.begin(115200);
-    // Don't wait for serial in production
     delay(1000);
 
     Serial.println("=================================");
@@ -58,14 +61,14 @@ void setup()
     // Initialize LEDs
     pinMode(LED_CONNECTED, OUTPUT);
     pinMode(LED_RECORDING, OUTPUT);
+
     digitalWrite(LED_CONNECTED, LOW);
-    digitalWrite(LED_RECORDING, HIGH);  // HIGH = OFF for RGB LED
+    digitalWrite(LED_RECORDING, HIGH);   // RGB LED is active LOW
 
     /* IMU init */
     if (!IMU.begin()) {
         Serial.println("ERROR: Failed to initialize IMU!");
         while (1) {
-            // Blink LED to indicate error
             digitalWrite(LED_CONNECTED, HIGH);
             delay(100);
             digitalWrite(LED_CONNECTED, LOW);
@@ -74,11 +77,20 @@ void setup()
     }
     Serial.println("IMU initialized OK");
 
+    if (EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME != 3) {
+        Serial.println("ERROR: Model expects RAW_SAMPLES_PER_FRAME = 3");
+        while (1) {
+            digitalWrite(LED_CONNECTED, HIGH);
+            delay(300);
+            digitalWrite(LED_CONNECTED, LOW);
+            delay(300);
+        }
+    }
+
     /* BLE init */
     if (!BLE.begin()) {
         Serial.println("ERROR: Failed to initialize BLE!");
         while (1) {
-            // Blink LED to indicate error
             digitalWrite(LED_CONNECTED, HIGH);
             delay(500);
             digitalWrite(LED_CONNECTED, LOW);
@@ -86,25 +98,25 @@ void setup()
         }
     }
 
-    // Set BLE device name and advertised service
+    // Device name shown on phone
     BLE.setLocalName("TennisDetector");
     BLE.setAdvertisedService(tennisService);
 
-    // Add characteristics to service
+    // Add characteristics
     tennisService.addCharacteristic(strokeCharacteristic);
     tennisService.addCharacteristic(controlCharacteristic);
-    
+
     // Add service
     BLE.addService(tennisService);
 
-    // Initialize characteristic values
-    strokeCharacteristic.writeValue(0);
-    controlCharacteristic.writeValue(0);
+    // Initial values
+    strokeCharacteristic.writeValue((byte)0);
+    controlCharacteristic.writeValue((byte)0);
 
-    // Set event handler for control characteristic
+    // Callback when app writes to control characteristic
     controlCharacteristic.setEventHandler(BLEWritten, onControlWritten);
 
-    // Start advertising
+    // Start BLE advertising
     BLE.advertise();
 
     Serial.println("BLE initialized OK");
@@ -114,103 +126,75 @@ void setup()
 }
 
 /* Callback when control characteristic is written */
-void onControlWritten(BLEDevice central, BLECharacteristic characteristic) {
+void onControlWritten(BLEDevice central, BLECharacteristic characteristic)
+{
     byte value = controlCharacteristic.value();
-    
+
     if (value == 1) {
         isRecording = true;
-        recordingStartTime = millis();
-        digitalWrite(LED_RECORDING, LOW);  // LOW = ON for RGB LED
-        Serial.println(">>> Recording STARTED (4 sec window)");
-    } else {
+        digitalWrite(LED_RECORDING, LOW);   // ON
+        Serial.println(">>> Recording STARTED");
+    }
+    else {
         isRecording = false;
-        digitalWrite(LED_RECORDING, HIGH);  // HIGH = OFF for RGB LED
+        digitalWrite(LED_RECORDING, HIGH);  // OFF
         Serial.println(">>> Recording STOPPED");
     }
-}
-
-/* Stop recording and notify via BLE */
-void stopRecordingAndNotify() {
-    isRecording = false;
-    digitalWrite(LED_RECORDING, HIGH);  // Turn off recording LED
-    controlCharacteristic.writeValue(0);  // Notify Flutter that recording stopped
-    Serial.println(">>> Recording AUTO-STOPPED");
-}
-
-/* Sign helper function */
-float ei_get_sign(float number) {
-    return (number >= 0.0) ? 1.0 : -1.0;
 }
 
 /* Main loop */
 void loop()
 {
-    // Poll for BLE events
     BLE.poll();
-    
+
     BLEDevice central = BLE.central();
 
     if (central) {
-        // Device connected
         digitalWrite(LED_CONNECTED, HIGH);
+
         Serial.print("Connected to: ");
         Serial.println(central.address());
 
         while (central.connected()) {
-            // Poll for BLE events
             BLE.poll();
-            
-            // Only detect strokes if recording is enabled
+
             if (isRecording) {
-                // Check if recording time exceeded 4 seconds
-                if (millis() - recordingStartTime >= RECORDING_DURATION_MS) {
-                    Serial.println(">>> Recording timeout (4 sec)");
-                    stopRecordingAndNotify();
-                } else {
-                    detectAndSendStroke();
-                }
-            } else {
-                // Small delay when not recording to avoid busy loop
+                detectAndSendStroke();
+            }
+            else {
                 delay(50);
             }
         }
 
-        // Device disconnected
+        // Reset state on disconnect
         digitalWrite(LED_CONNECTED, LOW);
-        digitalWrite(LED_RECORDING, HIGH);  // Turn off recording LED
+        digitalWrite(LED_RECORDING, HIGH);
         isRecording = false;
-        
+
         Serial.println("Device disconnected");
         Serial.println("Waiting for connections...");
+        Serial.println("---------------------------------");
     }
 }
 
 /* Detect stroke and send via BLE */
-void detectAndSendStroke() {
+void detectAndSendStroke()
+{
     float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE] = {0};
 
     Serial.println("Sampling accelerometer data...");
 
-    /* Collect accelerometer data */
+    // IMPORTANT:
+    // Training samples were captured in g, so we read and use acceleration
+    // directly in g. No conversion to m/s^2 is applied.
+
     for (size_t ix = 0; ix < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; ix += 3) {
         uint64_t next_tick = micros() + (EI_CLASSIFIER_INTERVAL_MS * 1000);
 
-        // Read acceleration values
+        // Read acceleration directly in g
         IMU.readAcceleration(buffer[ix], buffer[ix + 1], buffer[ix + 2]);
 
-        // Clamp values to accepted range
-        for (int i = 0; i < 3; i++) {
-            if (fabs(buffer[ix + i]) > MAX_ACCEPTED_RANGE) {
-                buffer[ix + i] = ei_get_sign(buffer[ix + i]) * MAX_ACCEPTED_RANGE;
-            }
-        }
-
-        // Convert from g to m/s^2
-        buffer[ix + 0] *= CONVERT_G_TO_MS2;
-        buffer[ix + 1] *= CONVERT_G_TO_MS2;
-        buffer[ix + 2] *= CONVERT_G_TO_MS2;
-
-        // Wait for next sample time
+        // Wait until next sample time
         while (micros() < next_tick) {
             delayMicroseconds(10);
         }
@@ -225,7 +209,8 @@ void detectAndSendStroke() {
     );
 
     if (err != 0) {
-        Serial.println("ERROR: Failed to create signal from buffer");
+        Serial.print("ERROR: Failed to create signal from buffer. Code: ");
+        Serial.println(err);
         return;
     }
 
@@ -240,65 +225,98 @@ void detectAndSendStroke() {
         return;
     }
 
-    /* Find the highest confidence prediction */
+    /* Find highest confidence prediction */
     int golpe = 0;
-    float max_val = 0.0;
-    float confidence_threshold = 0.6;  // Minimum confidence to report a stroke
+    float max_val = 0.0f;
 
     Serial.println("Predictions:");
-    
+
     for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+        const char *label = result.classification[ix].label;
+        float value = result.classification[ix].value;
+
         Serial.print("  ");
-        Serial.print(result.classification[ix].label);
+        Serial.print(label);
         Serial.print(": ");
-        Serial.println(result.classification[ix].value, 4);
+        Serial.println(value, 4);
 
-        if (result.classification[ix].value > max_val) {
-            max_val = result.classification[ix].value;
+        if (value > max_val) {
+            max_val = value;
 
-            // Map label to stroke code
-            if (strcmp(result.classification[ix].label, "ascendente") == 0)
+            if (strcmp(label, "ascendente") == 0) {
                 golpe = 1;
-            else if (strcmp(result.classification[ix].label, "derecha") == 0)
+            }
+            else if (strcmp(label, "derecha") == 0) {
                 golpe = 2;
-            else if (strcmp(result.classification[ix].label, "remate") == 0)
+            }
+            else if (strcmp(label, "remate") == 0) {
                 golpe = 3;
-            else if (strcmp(result.classification[ix].label, "reves") == 0)
+            }
+            else if (strcmp(label, "reves") == 0) {
                 golpe = 4;
-            else if (strcmp(result.classification[ix].label, "saque") == 0)
+            }
+            else if (strcmp(label, "saque") == 0) {
                 golpe = 5;
-            else
-                golpe = 0;  // Unknown or idle
+            }
+            else {
+                golpe = 0;
+            }
         }
     }
 
-    /* Send result via BLE only if confidence is high enough */
+    /* Send result via BLE only if confidence is high enough and cooldown passed */
     if (golpe != 0 && max_val >= confidence_threshold) {
-        strokeCharacteristic.writeValue(golpe);
-        
-        Serial.print(">>> Stroke detected: ");
-        printStrokeName(golpe);
-        Serial.print(" (confidence: ");
-        Serial.print(max_val * 100, 1);
-        Serial.println("%)");
-        
-        // Auto-stop recording after detecting a stroke
-        stopRecordingAndNotify();
-    } else {
+
+        if (millis() - lastStrokeTime >= strokeCooldown) {
+
+            if (strokeCharacteristic.subscribed()) {
+                strokeCharacteristic.writeValue((byte)golpe);
+            }
+
+            lastStrokeTime = millis();
+
+            Serial.print(">>> Stroke detected: ");
+            printStrokeName(golpe);
+            Serial.print(" (confidence: ");
+            Serial.print(max_val * 100.0f, 1);
+            Serial.println("%)");
+        }
+        else {
+            Serial.println("Stroke ignored due to cooldown");
+        }
+    }
+    else {
         Serial.println("No confident stroke detected");
     }
-    
+
     Serial.println("---------------------------------");
 }
 
 /* Helper function to print stroke name */
-void printStrokeName(int code) {
+void printStrokeName(int code)
+{
     switch (code) {
-        case 1: Serial.print("Ascendente"); break;
-        case 2: Serial.print("Derecha"); break;
-        case 3: Serial.print("Remate"); break;
-        case 4: Serial.print("Reves"); break;
-        case 5: Serial.print("Saque"); break;
-        default: Serial.print("Desconocido"); break;
+        case 1:
+            Serial.print("Ascendente");
+            break;
+        case 2:
+            Serial.print("Derecha");
+            break;
+        case 3:
+            Serial.print("Remate");
+            break;
+        case 4:
+            Serial.print("Reves");
+            break;
+        case 5:
+            Serial.print("Saque");
+            break;
+        default:
+            Serial.print("Desconocido");
+            break;
     }
 }
+
+#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_ACCELEROMETER
+#error "Invalid model for current sensor"
+#endif
