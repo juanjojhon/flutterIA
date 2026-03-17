@@ -5,6 +5,8 @@
  * This code waits for a BLE connection and a start command from
  * the Flutter app before beginning stroke detection.
  *
+ * Using NEW MODEL with higher accuracy: NicolasRC3008-project-1
+ *
  * Stroke codes sent by BLE:
  * 1 = Ascendente
  * 2 = Derecha
@@ -13,9 +15,13 @@
  * 5 = Saque
  */
 
-#include <NicolasR3008-project-1_inferencing.h>
+#include <NicolasRC3008-project-1_inferencing.h>
 #include <Arduino_LSM9DS1.h>
 #include <ArduinoBLE.h>
+
+/* Constants for acceleration conversion */
+#define CONVERT_G_TO_MS2    9.80665f
+#define MAX_ACCEPTED_RANGE  2.0f
 
 /* Debug */
 static bool debug_nn = false;
@@ -47,6 +53,7 @@ const float confidence_threshold = 0.60f;   // minimum confidence required
 void onControlWritten(BLEDevice central, BLECharacteristic characteristic);
 void detectAndSendStroke();
 void printStrokeName(int code);
+float ei_get_sign(float number);
 
 /* Setup */
 void setup()
@@ -56,6 +63,7 @@ void setup()
 
     Serial.println("=================================");
     Serial.println("Edge Impulse + BLE Tennis Detector");
+    Serial.println("NEW MODEL: NicolasRC3008-project-1");
     Serial.println("=================================");
 
     // Initialize LEDs
@@ -125,6 +133,16 @@ void setup()
     Serial.println("---------------------------------");
 }
 
+/**
+ * @brief Return the sign of the number
+ * 
+ * @param number 
+ * @return float 1.0 if positive (or 0) -1.0 if negative
+ */
+float ei_get_sign(float number) {
+    return (number >= 0.0) ? 1.0 : -1.0;
+}
+
 /* Callback when control characteristic is written */
 void onControlWritten(BLEDevice central, BLECharacteristic characteristic)
 {
@@ -184,20 +202,27 @@ void detectAndSendStroke()
 
     Serial.println("Sampling accelerometer data...");
 
-    // IMPORTANT:
-    // Training samples were captured in g, so we read and use acceleration
-    // directly in g. No conversion to m/s^2 is applied.
-
+    // This model uses m/s^2 conversion (like Edge Impulse default)
     for (size_t ix = 0; ix < EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE; ix += 3) {
         uint64_t next_tick = micros() + (EI_CLASSIFIER_INTERVAL_MS * 1000);
 
-        // Read acceleration directly in g
+        // Read acceleration in g
         IMU.readAcceleration(buffer[ix], buffer[ix + 1], buffer[ix + 2]);
 
-        // Wait until next sample time
-        while (micros() < next_tick) {
-            delayMicroseconds(10);
+        // Clamp to MAX_ACCEPTED_RANGE
+        for (int i = 0; i < 3; i++) {
+            if (fabs(buffer[ix + i]) > MAX_ACCEPTED_RANGE) {
+                buffer[ix + i] = ei_get_sign(buffer[ix + i]) * MAX_ACCEPTED_RANGE;
+            }
         }
+
+        // Convert g to m/s^2
+        buffer[ix + 0] *= CONVERT_G_TO_MS2;
+        buffer[ix + 1] *= CONVERT_G_TO_MS2;
+        buffer[ix + 2] *= CONVERT_G_TO_MS2;
+
+        // Wait until next sample time
+        delayMicroseconds(next_tick - micros());
     }
 
     /* Convert buffer to signal */
